@@ -1,0 +1,8 @@
+path: ../datasets/apriltags # dataset root dir
+train: train/images
+val: valid/images
+test: test/images
+
+nc: 1
+names: ['tags']
+
