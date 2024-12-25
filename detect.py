@@ -243,14 +243,17 @@ def parse_opt():
     parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
     parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
     parser.add_argument('--vid-stride', type=int, default=1, help='video frame-rate stride')
+    # 解析命令行参数，并将结果存储在opt对象中
     opt = parser.parse_args()
-    opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1  # expand
-    print_args(vars(opt))
+    opt.imgsz *= 2 if len(opt.imgsz) == 1 else 1 # 如果imgsz长度为1，则将其值乘以2；否则保持不变
+    print_args(vars(opt)) # 打印解析后的参数
     return opt
 
 
 def main(opt):
+    # 检查项目所需的依赖项，排除 'tensorboard' 和 'thop' 这两个库
     check_requirements(exclude=('tensorboard', 'thop'))
+    # 使用命令行参数的字典形式调用 run 函数
     run(**vars(opt))
 
 

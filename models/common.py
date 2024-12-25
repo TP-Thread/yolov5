@@ -35,28 +35,33 @@ from utils.torch_utils import copy_attr, smart_inference_mode
 
 
 def autopad(k, p=None, d=1):  # kernel, padding, dilation
-    # Pad to 'same' shape outputs
+    # 如果未提供 `p` 参数，则进行自动填充，使输出尺寸与输入相同 ('same' 填充)
     if d > 1:
         k = d * (k - 1) + 1 if isinstance(k, int) else [d * (x - 1) + 1 for x in k]  # actual kernel-size
     if p is None:
         p = k // 2 if isinstance(k, int) else [x // 2 for x in k]  # auto-pad
-    return p
+    return p # 返回计算的填充值
 
 
 class Conv(nn.Module):
-    # Standard convolution with args(ch_in, ch_out, kernel, stride, padding, groups, dilation, activation)
-    default_act = nn.SiLU()  # default activation
+    # CBS 标准卷积模块
+    default_act = nn.SiLU()  # 默认使用 SiLU 激活函数
 
-    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True):
+    def __init__(self, c1, c2, k=1, s=1, p=None, g=1, d=1, act=True): # 输入通道数, 输出通道数, 卷积核大小, 步幅, 填充, 组数, 激活函数
         super().__init__()
+        # 定义卷积层，自动计算填充，禁用偏置以配合批归一化层
         self.conv = nn.Conv2d(c1, c2, k, s, autopad(k, p, d), groups=g, dilation=d, bias=False)
+        # 定义批归一化层，归一化输出
         self.bn = nn.BatchNorm2d(c2)
+        # 定义激活函数，默认为 SiLU，如果 `act` 为 `False`，则使用 `nn.Identity()`，否则使用用户提供的模块
         self.act = self.default_act if act is True else act if isinstance(act, nn.Module) else nn.Identity()
 
     def forward(self, x):
+        # 标准前向传播：输入数据通过卷积、批归一化和激活函数
         return self.act(self.bn(self.conv(x)))
 
     def forward_fuse(self, x):
+        # 用于推理时的前向传播：输入数据直接通过卷积和激活函数，省略批归一化以提高速度
         return self.act(self.conv(x))
 
 
@@ -109,15 +114,18 @@ class TransformerBlock(nn.Module):
 
 
 class Bottleneck(nn.Module):
-    # Standard bottleneck
+    # 标准瓶颈层，常用于减少参数并提高模型的计算效率
     def __init__(self, c1, c2, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, shortcut, groups, expansion
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_, c2, 3, 1, g=g)
+        self.cv1 = Conv(c1, c_, 1, 1) # 第一个 1x1 卷积，用于降维
+        self.cv2 = Conv(c_, c2, 3, 1, g=g) # 第二个 3x3 卷积，用于特征提取
+        # 判断是否启用捷径连接（shortcut），仅当 `c1` 等于 `c2` 且 `shortcut` 为 True 时启用
         self.add = shortcut and c1 == c2
 
     def forward(self, x):
+        # 如果 `self.add` 为 True，则返回输入 `x` 与经过两个卷积层后的输出的相加结果（残差连接）
+        # 否则，仅返回卷积后的输出
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
 
 
@@ -155,16 +163,18 @@ class CrossConv(nn.Module):
 
 
 class C3(nn.Module):
-    # CSP Bottleneck with 3 convolutions
-    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # ch_in, ch_out, number, shortcut, groups, expansion
+    # CSP（Cross Stage Partial）瓶颈结构，带有 3 个卷积层
+    def __init__(self, c1, c2, n=1, shortcut=True, g=1, e=0.5):  # 输入通道数, 输出通道数, 层数, 是否使用捷径连接, 组数, 扩展系数
         super().__init__()
         c_ = int(c2 * e)  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c1, c_, 1, 1)
-        self.cv3 = Conv(2 * c_, c2, 1)  # optional act=FReLU(c2)
+        self.cv1 = Conv(c1, c_, 1, 1) # 第一分支的 1x1 卷积层，用于降维
+        self.cv2 = Conv(c1, c_, 1, 1) # 第二分支的 1x1 卷积层，用于降维
+        self.cv3 = Conv(2 * c_, c2, 1)  # 最后的 1x1 卷积层，用于合并输出通道
+         # 创建 `n` 个 `Bottleneck` 层，使用 nn.Sequential 进行顺序连接
         self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, e=1.0) for _ in range(n)))
 
     def forward(self, x):
+        # 将经过 `self.cv1` 和 `self.m` 的输出，以及 `self.cv2` 的输出在通道维度上拼接
         return self.cv3(torch.cat((self.m(self.cv1(x)), self.cv2(x)), 1))
 
 
@@ -219,18 +229,36 @@ class SPP(nn.Module):
 class SPPF(nn.Module):
     # Spatial Pyramid Pooling - Fast (SPPF) layer for YOLOv5 by Glenn Jocher
     def __init__(self, c1, c2, k=5):  # equivalent to SPP(k=(5, 9, 13))
+        """
+        初始化SPPF层。
+
+        参数:
+        c1 (int): 输入通道数。
+        c2 (int): 输出通道数。
+        k (int): 最大池化的核大小，默认为5，代表使用的核为k=(5, 9, 13)。
+        """
         super().__init__()
-        c_ = c1 // 2  # hidden channels
-        self.cv1 = Conv(c1, c_, 1, 1)
-        self.cv2 = Conv(c_ * 4, c2, 1, 1)
-        self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2)
+        c_ = c1 // 2  # 计算隐藏通道数，通常取输入通道数的一半
+        self.cv1 = Conv(c1, c_, 1, 1) # 1x1卷积层，将输入通道数c1转换为隐藏通道数c_
+        self.cv2 = Conv(c_ * 4, c2, 1, 1) # 1x1卷积层，将拼接后的通道数转换为输出通道数c2
+        self.m = nn.MaxPool2d(kernel_size=k, stride=1, padding=k // 2) # 定义最大池化层，核大小为k，步长为1，填充为k的一半
 
     def forward(self, x):
-        x = self.cv1(x)
+        """
+        前向传播函数。
+
+        参数:
+        x (Tensor): 输入的特征图。
+
+        返回:
+        Tensor: 经过SPPF层处理后的输出特征图。
+        """
+        x = self.cv1(x) # 通过第一层卷积处理输入特征图
         with warnings.catch_warnings():
-            warnings.simplefilter('ignore')  # suppress torch 1.9.0 max_pool2d() warning
-            y1 = self.m(x)
-            y2 = self.m(y1)
+            warnings.simplefilter('ignore')  # 抑制torch 1.9.0中的max_pool2d()警告
+            y1 = self.m(x) # 对处理后的特征图进行第一次最大池化
+            y2 = self.m(y1) # 对第一次池化的结果进行第二次最大池化
+            # 将原始特征图和三次池化的结果进行拼接，然后通过第二层卷积进行处理
             return self.cv2(torch.cat((x, y1, y2, self.m(y2)), 1))
 
 

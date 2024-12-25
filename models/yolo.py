@@ -37,16 +37,16 @@ except ImportError:
 
 class Detect(nn.Module):
     # YOLOv5 Detect head for detection models
-    stride = None  # strides computed during build
+    stride = None  # 在构建过程中计算的 strides（步幅）
     dynamic = False  # force grid reconstruction
     export = False  # export mode
 
-    def __init__(self, nc=80, anchors=(), ch=(), inplace=True):  # detection layer
+    def __init__(self, nc=80, anchors=(), ch=(), inplace=True):  # 检测层的初始化
         super().__init__()
-        self.nc = nc  # number of classes
-        self.no = nc + 5  # number of outputs per anchor
-        self.nl = len(anchors)  # number of detection layers
-        self.na = len(anchors[0]) // 2  # number of anchors
+        self.nc = nc  # 检测的类别数量（默认80类）
+        self.no = nc + 5  # 每个锚点的输出数量（类别数 + 5个额外信息：x, y, w, h, 置信度）
+        self.nl = len(anchors)  # 检测层的数量（通常是3）
+        self.na = len(anchors[0]) // 2  # 每层的锚点数量（每个锚点由两个值组成：宽度和高度）
         self.grid = [torch.empty(0) for _ in range(self.nl)]  # init grid
         self.anchor_grid = [torch.empty(0) for _ in range(self.nl)]  # init anchor grid
         self.register_buffer('anchors', torch.tensor(anchors).float().view(self.nl, -1, 2))  # shape(nl,na,2)
@@ -164,31 +164,35 @@ class BaseModel(nn.Module):
 
 class DetectionModel(BaseModel):
     # YOLOv5 detection model
-    def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None, anchors=None):  # model, input channels, number of classes
+    def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None, anchors=None):   # 初始化模型，输入通道数
         super().__init__()
-        if isinstance(cfg, dict):
-            self.yaml = cfg  # model dict
-        else:  # is *.yaml
-            import yaml  # for torch hub
-            self.yaml_file = Path(cfg).name
-            with open(cfg, encoding='ascii', errors='ignore') as f:
-                self.yaml = yaml.safe_load(f)  # model dict
+        if isinstance(cfg, dict): # 如果配置是字典，直接使用它作为模型配置
+            self.yaml = cfg
+        else:  # 如果配置是一个 *.yaml 文件
+            import yaml  # 导入yaml库，用于加载yaml配置文件
+            self.yaml_file = Path(cfg).name # 获取文件名
+            with open(cfg, encoding='ascii', errors='ignore') as f: # 打开yaml文件
+                self.yaml = yaml.safe_load(f)  # 读取并解析yaml文件为字典
 
-        # Define model
-        ch = self.yaml['ch'] = self.yaml.get('ch', ch)  # input channels
+        # 设置模型配置
+        ch = self.yaml['ch'] = self.yaml.get('ch', ch)  # 获取输入通道数，如果yaml没有提供，则使用默认值ch
+        # 如果提供了类别数且与yaml文件中的类别数不匹配，则进行覆盖
         if nc and nc != self.yaml['nc']:
             LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
             self.yaml['nc'] = nc  # override yaml value
+        # 如果提供了锚点，覆盖yaml中的锚点
         if anchors:
             LOGGER.info(f'Overriding model.yaml anchors with anchors={anchors}')
             self.yaml['anchors'] = round(anchors)  # override yaml value
-        self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
+        
+        # 解析模型架构，生成模型和保存列表
+        self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # 深拷贝yaml配置并解析模型
         self.names = [str(i) for i in range(self.yaml['nc'])]  # default names
         self.inplace = self.yaml.get('inplace', True)
 
-        # Build strides, anchors
-        m = self.model[-1]  # Detect()
-        if isinstance(m, (Detect, Segment)):
+        # 构建步幅（stride）和锚点
+        m = self.model[-1]  # 获取模型的最后一层（通常是检测层）
+        if isinstance(m, (Detect, Segment)): # 如果是 Detect 层（YOLO 的检测层）
             s = 256  # 2x min stride
             m.inplace = self.inplace
             forward = lambda x: self.forward(x)[0] if isinstance(m, Segment) else self.forward(x)
@@ -200,13 +204,13 @@ class DetectionModel(BaseModel):
 
         # Init weights, biases
         initialize_weights(self)
-        self.info()
+        self.info() # 输出模型信息
         LOGGER.info('')
 
     def forward(self, x, augment=False, profile=False, visualize=False):
         if augment:
             return self._forward_augment(x)  # augmented inference, None
-        return self._forward_once(x, profile, visualize)  # single-scale inference, train
+        return self._forward_once(x, profile, visualize)  # 执行标准的单尺度推理（通常用于训练过程）
 
     def _forward_augment(self, x):
         img_size = x.shape[-2:]  # height, width
@@ -295,30 +299,36 @@ class ClassificationModel(BaseModel):
         # Create a YOLOv5 classification model from a *.yaml file
         self.model = None
 
-
-def parse_model(d, ch):  # model_dict, input_channels(3)
+# 解析模型的结构并构建模型
+def parse_model(d, ch):  # 输入：model_dict, input_channels(3)
     # Parse a YOLOv5 model.yaml dictionary
     LOGGER.info(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
-    anchors, nc, gd, gw, act = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple'], d.get('activation')
+    anchors, nc, gd, gw, act = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple'], d.get('activation') # 提取模型配置中的锚框、类数、深度和宽度倍数
     if act:
         Conv.default_act = eval(act)  # redefine default activation, i.e. Conv.default_act = nn.SiLU()
         LOGGER.info(f"{colorstr('activation:')} {act}")  # print
-    na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
-    no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
+    na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # 计算锚框数量
+    no = na * (nc + 5)  # 输出数量 = 锚框数 * (类别数 + 5)，5是包括x, y, w, h, confidence
 
-    layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
+    layers, save, c2 = [], [], ch[-1]  # 初始化层列表、保存列表、输出通道数（初始值为最后一层的通道数）
+
+    # 遍历模型字典中的backbone和head部分
     for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
+        # 如果模块是字符串，将其转换为模块
         m = eval(m) if isinstance(m, str) else m  # eval strings
         for j, a in enumerate(args):
             with contextlib.suppress(NameError):
                 args[j] = eval(a) if isinstance(a, str) else a  # eval strings
 
+        # 根据深度倍数计算每个模块的重复次数，至少为1
         n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
+
+        # 如果模块是常见的卷积或瓶颈结构，确定输入输出通道数并进行相应处理
         if m in {
                 Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
                 BottleneckCSP, C3, C3TR, C3SPP, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x}:
-            c1, c2 = ch[f], args[0]
-            if c2 != no:  # if not output
+            c1, c2 = ch[f], args[0] # c1、c2分别代表输入和输出通道数
+            if c2 != no:  # 如果输出通道数不是目标输出通道数，即该模块不是输出层，对输出通道数进行宽度倍数调整
                 c2 = make_divisible(c2 * gw, 8)
 
             args = [c1, c2, *args[1:]]
@@ -353,12 +363,14 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
         if i == 0:
             ch = []
         ch.append(c2)
+    
+    # 返回一个由所有模块组成的顺序容器(nn.Sequential)，以及按升序排序的保存列表
     return nn.Sequential(*layers), sorted(save)
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--cfg', type=str, default='yolov5s.yaml', help='model.yaml')
+    parser = argparse.ArgumentParser() # 创建 ArgumentParser 对象，用于命令行参数解析
+    parser.add_argument('--cfg', type=str, default='yolov5s.yaml', help='model.yaml') # 添加参数 --cfg，指定模型配置文件
     parser.add_argument('--batch-size', type=int, default=1, help='total batch size for all GPUs')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
     parser.add_argument('--profile', action='store_true', help='profile model speed')
@@ -366,10 +378,10 @@ if __name__ == '__main__':
     parser.add_argument('--test', action='store_true', help='test all yolo*.yaml')
     opt = parser.parse_args()
     opt.cfg = check_yaml(opt.cfg)  # check YAML
-    print_args(vars(opt))
+    print_args(vars(opt)) # 打印配置文件和解析后的命令行参数
     device = select_device(opt.device)
 
-    # Create model
+    # 创建模型
     im = torch.rand(opt.batch_size, 3, 640, 640).to(device)
     model = Model(opt.cfg).to(device)
 
