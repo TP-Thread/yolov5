@@ -340,14 +340,18 @@ class LoadStreams:
     # YOLOv5 streamloader, i.e. `python detect.py --source 'rtsp://example.com/media.mp4'  # RTSP, RTMP, HTTP streams`
     def __init__(self, sources='streams.txt', img_size=640, stride=32, auto=True, transforms=None, vid_stride=1):
         torch.backends.cudnn.benchmark = True  # faster for fixed-size inference
+        # 设置模式为流,图像大小和步长
         self.mode = 'stream'
         self.img_size = img_size
         self.stride = stride
         self.vid_stride = vid_stride  # video frame-rate stride
+        # 读取文件内容
         sources = Path(sources).read_text().rsplit() if os.path.isfile(sources) else [sources]
-        n = len(sources)
+        n = len(sources) # 获取源数量
         self.sources = [clean_str(x) for x in sources]  # clean source names for later
+        # 初始化图像、帧率、帧数和线程的列表
         self.imgs, self.fps, self.frames, self.threads = [None] * n, [0] * n, [0] * n, [None] * n
+        # 遍历源列表
         for i, s in enumerate(sources):  # index, source
             # Start thread to read frames from video stream
             st = f'{i + 1}/{n}: {s}... '
@@ -360,11 +364,14 @@ class LoadStreams:
             if s == 0:
                 assert not is_colab(), '--source 0 webcam unsupported on Colab. Rerun command in a local environment.'
                 assert not is_kaggle(), '--source 0 webcam unsupported on Kaggle. Rerun command in a local environment.'
+            # 打开视频流
             cap = cv2.VideoCapture(s)
             assert cap.isOpened(), f'{st}Failed to open {s}'
+            # 获取视频流的宽度、高度和帧率
             w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
             h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
             fps = cap.get(cv2.CAP_PROP_FPS)  # warning: may return 0 or nan
+            # 获取帧数，默认为无限流
             self.frames[i] = max(int(cap.get(cv2.CAP_PROP_FRAME_COUNT)), 0) or float('inf')  # infinite stream fallback
             self.fps[i] = max((fps if math.isfinite(fps) else 0) % 100, 0) or 30  # 30 FPS fallback
 
@@ -374,9 +381,9 @@ class LoadStreams:
             self.threads[i].start()
         LOGGER.info('')  # newline
 
-        # check for common shapes
+        # 检查图像形状的一致性
         s = np.stack([letterbox(x, img_size, stride=stride, auto=auto)[0].shape for x in self.imgs])
-        self.rect = np.unique(s, axis=0).shape[0] == 1  # rect inference if all shapes equal
+        self.rect = np.unique(s, axis=0).shape[0] == 1  # 如果所有形状相等，则进行矩形推理
         self.auto = auto and self.rect
         self.transforms = transforms  # optional
         if not self.rect:
