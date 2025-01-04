@@ -60,6 +60,7 @@ from utils.plots import plot_evolve
 from utils.torch_utils import (EarlyStopping, ModelEMA, de_parallel, select_device, smart_DDP, smart_optimizer,
                                smart_resume, torch_distributed_zero_first)
 
+# 分布式训练初始化
 LOCAL_RANK = int(os.getenv('LOCAL_RANK', -1))  # https://pytorch.org/docs/stable/elastic/run.html
 RANK = int(os.getenv('RANK', -1))
 WORLD_SIZE = int(os.getenv('WORLD_SIZE', 1))
@@ -67,21 +68,22 @@ GIT_INFO = check_git_info()
 
 
 def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictionary
+    # 从opt获取参数。日志保存路径，轮次、批次、权重、进程序号(主要用于分布式训练)等
     save_dir, epochs, batch_size, weights, single_cls, evolve, data, cfg, resume, noval, nosave, workers, freeze = \
         Path(opt.save_dir), opt.epochs, opt.batch_size, opt.weights, opt.single_cls, opt.evolve, opt.data, opt.cfg, \
         opt.resume, opt.noval, opt.nosave, opt.workers, opt.freeze
     callbacks.run('on_pretrain_routine_start')
 
-    # Directories
-    w = save_dir / 'weights'  # weights dir
-    (w.parent if evolve else w).mkdir(parents=True, exist_ok=True)  # make dir
-    last, best = w / 'last.pt', w / 'best.pt'
+    # 创建保存模型权重的目录
+    w = save_dir / 'weights'  # 权重保存目录
+    (w.parent if evolve else w).mkdir(parents=True, exist_ok=True)  # 如果需要演化，则创建父目录，否则创建权重目录
+    last, best = w / 'last.pt', w / 'best.pt' # 定义最后和最好的模型文件路径
 
-    # Hyperparameters
+    # 加载超参数
     if isinstance(hyp, str):
         with open(hyp, errors='ignore') as f:
-            hyp = yaml.safe_load(f)  # load hyps dict
-    LOGGER.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
+            hyp = yaml.safe_load(f)  # 从YAML文件中加载超参数字典
+    LOGGER.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items())) # 记录超参数信息
     opt.hyp = hyp.copy()  # for saving hyps to checkpoints
 
     # Save run settings
@@ -89,12 +91,12 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         yaml_save(save_dir / 'hyp.yaml', hyp)
         yaml_save(save_dir / 'opt.yaml', vars(opt))
 
-    # Loggers
-    data_dict = None
-    if RANK in {-1, 0}:
-        loggers = Loggers(save_dir, weights, opt, hyp, LOGGER)  # loggers instance
+    # 初始化日志记录器
+    data_dict = None # 初始化数据字典
+    if RANK in {-1, 0}: # 仅在主进程中执行
+        loggers = Loggers(save_dir, weights, opt, hyp, LOGGER)   # 创建日志记录器实例
 
-        # Register actions
+        # 注册回调函数
         for k in methods(loggers):
             callbacks.register_action(k, callback=getattr(loggers, k))
 
@@ -103,38 +105,48 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         if resume:  # If resuming runs from remote artifact
             weights, epochs, hyp, batch_size = opt.weights, opt.epochs, opt.hyp, opt.batch_size
 
-    # Config
-    plots = not evolve and not opt.noplots  # create plots
-    cuda = device.type != 'cpu'
-    init_seeds(opt.seed + 1 + RANK, deterministic=True)
+    # 配置
+    plots = not evolve and not opt.noplots  # 是否创建绘图，演化模式下不创建
+    cuda = device.type != 'cpu' # 检查是否使用 CUDA（GPU）
+    init_seeds(opt.seed + 1 + RANK, deterministic=True) # 初始化随机种子，确保每个进程的种子不同
+    
+    # 在分布式训练的主进程中执行以下操作
     with torch_distributed_zero_first(LOCAL_RANK):
-        data_dict = data_dict or check_dataset(data)  # check if None
+        data_dict = data_dict or check_dataset(data) # 检查数据集，如果数据字典为 None，则加载数据集
+
+    # 获取训练和验证数据集的路径   
     train_path, val_path = data_dict['train'], data_dict['val']
-    nc = 1 if single_cls else int(data_dict['nc'])  # number of classes
+    nc = 1 if single_cls else int(data_dict['nc'])  # 获取类别数量，单类别情况下数量为 1
+    # 获取类别名称，如果是单类别且名称列表长度不为 1，则设为 ['item']
     names = {0: 'item'} if single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
+    # 检查数据集是否为 COCO 数据集，且类别数量是否为 80
     is_coco = isinstance(val_path, str) and val_path.endswith('coco/val2017.txt')  # COCO dataset
 
     # Model
-    check_suffix(weights, '.pt')  # check weights
-    pretrained = weights.endswith('.pt')
-    if pretrained:
+    check_suffix(weights, '.pt')  # 检查权重文件的后缀是否为.pt
+    pretrained = weights.endswith('.pt') # 判断权重文件是否为预训练模型
+    if pretrained: # 如果是预训练模型，则尝试下载它
         with torch_distributed_zero_first(LOCAL_RANK):
-            weights = attempt_download(weights)  # download if not found locally
+            weights = attempt_download(weights)  # 如果本地找不到权重文件，则下载
+
         ckpt = torch.load(weights, map_location='cpu')  # load checkpoint to CPU to avoid CUDA memory leak
+        
+        # 创建模型，cfg为配置文件，ch为输入通道数（一般为3），nc为类别数，anchors为锚框
         model = Model(cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        
         exclude = ['anchor'] if (cfg or hyp.get('anchors')) and not resume else []  # exclude keys
         csd = ckpt['model'].float().state_dict()  # checkpoint state_dict as FP32
         csd = intersect_dicts(csd, model.state_dict(), exclude=exclude)  # intersect
-        model.load_state_dict(csd, strict=False)  # load
+        model.load_state_dict(csd, strict=False)  # 加载参数
         LOGGER.info(f'Transferred {len(csd)}/{len(model.state_dict())} items from {weights}')  # report
-    else:
+    else: # 如果不是预训练模型，则使用给定的cfg创建新模型
         model = Model(cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
     amp = check_amp(model)  # check AMP
 
-    # Freeze
+    # 定义需要冻结的层
     freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # layers to freeze
     for k, v in model.named_parameters():
-        v.requires_grad = True  # train all layers
+        v.requires_grad = True  # 默认所有层均可训练
         # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
         if any(x in k for x in freeze):
             LOGGER.info(f'freezing {k}')
@@ -149,9 +161,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         batch_size = check_train_batch_size(model, imgsz, amp)
         loggers.on_params_update({"batch_size": batch_size})
 
-    # Optimizer
+    # 优化器
     nbs = 64  # nominal batch size
-    accumulate = max(round(nbs / batch_size), 1)  # accumulate loss before optimizing
+    accumulate = max(round(nbs / batch_size), 1)  # 在优化之前累积损失
     hyp['weight_decay'] *= batch_size * accumulate / nbs  # scale weight_decay
     optimizer = smart_optimizer(model, opt.optimizer, hyp['lr0'], hyp['momentum'], hyp['weight_decay'])
 
@@ -200,11 +212,13 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                               prefix=colorstr('train: '),
                                               shuffle=True)
     labels = np.concatenate(dataset.labels, 0)
-    mlc = int(labels[:, 0].max())  # max label class
+    mlc = int(labels[:, 0].max()) # 找到数据集中最大标签类
+    # 检查最大标签类是否小于类别总数
     assert mlc < nc, f'Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}'
 
     # Process 0
     if RANK in {-1, 0}:
+        # 创建验证数据加载器，批大小是原来的两倍
         val_loader = create_dataloader(val_path,
                                        imgsz,
                                        batch_size // WORLD_SIZE * 2,
@@ -218,7 +232,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                        pad=0.5,
                                        prefix=colorstr('val: '))[0]
 
-        if not resume:
+        if not resume: # 如果不是恢复训练
             if not opt.noautoanchor:
                 check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)  # run AutoAnchor
             model.half().float()  # pre-reduce anchor precision
@@ -227,7 +241,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
     # DDP mode
     if cuda and RANK != -1:
-        model = smart_DDP(model)
+        model = smart_DDP(model) # 使用分布式数据并行（DDP）包装模型
 
     # Model attributes
     nl = de_parallel(model).model[-1].nl  # number of detection layers (to scale hyps)
@@ -257,11 +271,12 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 f'Using {train_loader.num_workers * WORLD_SIZE} dataloader workers\n'
                 f"Logging results to {colorstr('bold', save_dir)}\n"
                 f'Starting training for {epochs} epochs...')
-    for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
+    
+    for epoch in range(start_epoch, epochs):  # 训练周期循环 ------------------------------------------------------------------
         callbacks.run('on_train_epoch_start')
-        model.train()
+        model.train() # 设置模型为训练模式
 
-        # Update image weights (optional, single-GPU only)
+        # 可选：更新图像权重（仅适用于单GPU）
         if opt.image_weights:
             cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc  # class weights
             iw = labels_to_image_weights(dataset.labels, nc=nc, class_weights=cw)  # image weights
@@ -271,7 +286,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
         # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
 
-        mloss = torch.zeros(3, device=device)  # mean losses
+        mloss = torch.zeros(3, device=device)  # 初始化平均损失
         if RANK != -1:
             train_loader.sampler.set_epoch(epoch)
         pbar = enumerate(train_loader)
@@ -279,10 +294,11 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         if RANK in {-1, 0}:
             pbar = tqdm(pbar, total=nb, bar_format=TQDM_BAR_FORMAT)  # progress bar
         optimizer.zero_grad()
-        for i, (imgs, targets, paths, _) in pbar:  # batch -------------------------------------------------------------
+
+        for i, (imgs, targets, paths, _) in pbar:  # 批处理循环 -------------------------------------------------------------
             callbacks.run('on_train_batch_start')
-            ni = i + nb * epoch  # number integrated batches (since train start)
-            imgs = imgs.to(device, non_blocking=True).float() / 255  # uint8 to float32, 0-255 to 0.0-1.0
+            ni = i + nb * epoch  # 计算自训练开始以来的集成批次数
+            imgs = imgs.to(device, non_blocking=True).float() / 255  # 将uint8类型转换为float32并归一化
 
             # Warmup
             if ni <= nw:
@@ -304,27 +320,27 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     imgs = nn.functional.interpolate(imgs, size=ns, mode='bilinear', align_corners=False)
 
             # Forward
-            with torch.amp.autocast('cuda', enabled=amp):
-                pred = model(imgs)  # forward
-                loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
+            with torch.amp.autocast('cuda', enabled=amp): # 使用混合精度训练
+                pred = model(imgs)  # 前向传播得到预测
+                loss, loss_items = compute_loss(pred, targets.to(device))  # 计算损失
                 if RANK != -1:
-                    loss *= WORLD_SIZE  # gradient averaged between devices in DDP mode
+                    loss *= WORLD_SIZE  # 在DDP模式下进行梯度平均
                 if opt.quad:
-                    loss *= 4.
+                    loss *= 4. # 如果使用四元组，则损失乘以4
 
             # Backward
-            scaler.scale(loss).backward()
+            scaler.scale(loss).backward() # 反向传播并缩放
 
             # Optimize - https://pytorch.org/docs/master/notes/amp_examples.html
-            if ni - last_opt_step >= accumulate:
+            if ni - last_opt_step >= accumulate:  # 如果达到累积步骤
                 scaler.unscale_(optimizer)  # unscale gradients
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)  # clip gradients
-                scaler.step(optimizer)  # optimizer.step
-                scaler.update()
-                optimizer.zero_grad()
-                if ema:
-                    ema.update(model)
-                last_opt_step = ni
+                scaler.step(optimizer)  # 更新优化器
+                scaler.update() # 更新缩放器
+                optimizer.zero_grad() # 清零梯度
+                if ema: # 如果使用EMA（指数移动平均）
+                    ema.update(model) # 更新EMA
+                last_opt_step = ni # 更新上一次优化步骤
 
             # Log
             if RANK in {-1, 0}:
@@ -335,14 +351,14 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 callbacks.run('on_train_batch_end', model, ni, imgs, targets, paths, list(mloss))
                 if callbacks.stop_training:
                     return
-            # end batch ------------------------------------------------------------------------------------------------
+            # 结束批处理循环 ------------------------------------------------------------------------------------------------
 
-        # Scheduler
-        lr = [x['lr'] for x in optimizer.param_groups]  # for loggers
-        scheduler.step()
+        # 学习率调度器
+        lr = [x['lr'] for x in optimizer.param_groups]  # 记录当前学习率
+        scheduler.step() # 更新学习率
 
-        if RANK in {-1, 0}:
-            # mAP
+        if RANK in {-1, 0}: # 如果是主进程
+            # 计算mAP（平均精度均值）
             callbacks.run('on_train_epoch_end', epoch=epoch)
             ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'names', 'stride', 'class_weights'])
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
@@ -359,7 +375,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                                                 callbacks=callbacks,
                                                 compute_loss=compute_loss)
 
-            # Update best mAP
+            # 更新最佳mAP
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
             stop = stopper(epoch=epoch, fitness=fi)  # early stop check
             if fi > best_fitness:
@@ -367,7 +383,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             log_vals = list(mloss) + list(results) + lr
             callbacks.run('on_fit_epoch_end', log_vals, epoch, best_fitness, fi)
 
-            # Save model
+            # 保存模型
             if (not nosave) or (final_epoch and not evolve):  # if save
                 ckpt = {
                     'epoch': epoch,
@@ -477,13 +493,13 @@ def parse_opt(known=False):
 
 
 def main(opt, callbacks=Callbacks()):
-    # Checks
+    # 主进程检查
     if RANK in {-1, 0}:
-        print_args(vars(opt))
-        check_git_status()
-        check_requirements()
+        print_args(vars(opt)) # 打印运行参数
+        check_git_status() # 检测YOLO v5的github仓库是否更新，若已更新，给出提示
+        check_requirements() # 检查requirements.txt所需包是否都满足，排除'thop'包
 
-    # Resume (from specified or most recent last.pt)
+    # 判断是否断点续训
     if opt.resume and not check_comet_resume(opt) and not opt.evolve:
         last = Path(check_file(opt.resume) if isinstance(opt.resume, str) else get_latest_run())
         opt_yaml = last.parent.parent / 'opt.yaml'  # train options yaml
@@ -497,6 +513,7 @@ def main(opt, callbacks=Callbacks()):
         opt.cfg, opt.weights, opt.resume = '', str(last), True  # reinstate
         if is_url(opt_data):
             opt.data = check_file(opt_data)  # avoid HUB resume auth timeout
+    # 不使用断点续训，就从文件中读取相关参数
     else:
         opt.data, opt.cfg, opt.hyp, opt.weights, opt.project = \
             check_file(opt.data), check_yaml(opt.cfg), check_yaml(opt.hyp), str(opt.weights), str(opt.project)  # checks
@@ -509,7 +526,7 @@ def main(opt, callbacks=Callbacks()):
             opt.name = Path(opt.cfg).stem  # use model.yaml as name
         opt.save_dir = str(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))
 
-    # DDP mode
+    # DDP模式（分布式数据并行）
     device = select_device(opt.device, batch_size=opt.batch_size)
     if LOCAL_RANK != -1:
         msg = 'is not compatible with YOLOv5 Multi-GPU DDP training'
@@ -522,11 +539,11 @@ def main(opt, callbacks=Callbacks()):
         device = torch.device('cuda', LOCAL_RANK)
         dist.init_process_group(backend="nccl" if dist.is_nccl_available() else "gloo")
 
-    # Train
-    if not opt.evolve:
+    # 训练模型
+    if not opt.evolve: # 如果不进行超参数进化，则直接调用train()函数，开始训练
         train(opt.hyp, opt, device, callbacks)
 
-    # Evolve hyperparameters (optional)
+    # 进行超参数演化（可选）
     else:
         # Hyperparameter evolution metadata (mutation scale 0-1, lower_limit, upper_limit)
         meta = {
@@ -560,18 +577,24 @@ def main(opt, callbacks=Callbacks()):
             'mixup': (1, 0.0, 1.0),  # image mixup (probability)
             'copy_paste': (1, 0.0, 1.0)}  # segment copy-paste (probability)
 
+        # 打开超参数文件并加载超参数字典
         with open(opt.hyp, errors='ignore') as f:
             hyp = yaml.safe_load(f)  # load hyps dict
             if 'anchors' not in hyp:  # anchors commented in hyp.yaml
                 hyp['anchors'] = 3
         if opt.noautoanchor:
             del hyp['anchors'], meta['anchors']
+
+        # 设置选项，指示只进行验证和保存最终的训练结果
         opt.noval, opt.nosave, save_dir = True, True, Path(opt.save_dir)  # only val/save final epoch
-        # ei = [isinstance(x, (int, float)) for x in hyp.values()]  # evolvable indices
+        # ei = [isinstance(x, (int, float)) for x in hyp.values()]  # 定义演化文件路径
         evolve_yaml, evolve_csv = save_dir / 'hyp_evolve.yaml', save_dir / 'evolve.csv'
+        # 如果指定了云存储桶
         if opt.bucket:
+            # 下载已有的 evolve.csv 文件
             os.system(f'gsutil cp gs://{opt.bucket}/evolve.csv {evolve_csv}')  # download evolve.csv if exists
 
+        # 进行指定轮数的超参数演化
         for _ in range(opt.evolve):  # generations to evolve
             if evolve_csv.exists():  # if evolve.csv exists: select best hyps and mutate
                 # Select parent(s)
@@ -619,12 +642,13 @@ def main(opt, callbacks=Callbacks()):
                     f'Usage example: $ python train.py --hyp {evolve_yaml}')
 
 
+# run()函数是为导入时提供的，别的模块导入了train模块，即可通过调用run()函数执行训练过程
 def run(**kwargs):
-    # Usage: import train; train.run(data='coco128.yaml', imgsz=320, weights='yolov5m.pt')
-    opt = parse_opt(True)
-    for k, v in kwargs.items():
-        setattr(opt, k, v)
-    main(opt)
+    # 用法示例: import train; train.run(data='coco128.yaml', imgsz=320, weights='yolov5m.pt')
+    opt = parse_opt(True) # 解析命令行参数并返回选项对象
+    for k, v in kwargs.items(): # 遍历关键字参数
+        setattr(opt, k, v) # 将每个参数设置到选项对象中
+    main(opt) # 调用主函数，传入选项对象
     return opt
 
 

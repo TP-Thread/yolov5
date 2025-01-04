@@ -23,7 +23,7 @@ import cv2
 # results.show()
 
 # 打开摄像头 默认为0，cv2.CAP_V4L2 是Video for Linux 2的一个常量，用于指定使用V4L2驱动程序进行视频捕获
-cap = cv2.VideoCapture(4, cv2.CAP_V4L2)
+cap = cv2.VideoCapture(6, cv2.CAP_V4L2)
 
 # 获取视频帧率
 fps = cap.get(cv2.CAP_PROP_FPS)

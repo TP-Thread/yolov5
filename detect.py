@@ -134,11 +134,11 @@ def run(
     for path, im, im0s, vid_cap, s in dataset:
         '''
          在dataset中，每次迭代的返回值是self.sources, img, img0, None, ''
-          path：文件路径（即source）
+          path: 文件路径（即source）
           im: resize后的图片（经过了放缩操作）
           im0s: 原始图片
           vid_cap=none
-          s： 图片的基本信息，比如路径，大小
+          s: 图片的基本信息，比如路径，大小
         '''
         with dt[0]:
             # 将图像数据从 numpy 转换为 torch 张量，并加载到设备
