@@ -326,7 +326,9 @@ def parse_model(d, ch):  # 输入：model_dict, input_channels(3)
         # 如果模块是常见的卷积或瓶颈结构，确定输入输出通道数并进行相应处理
         if m in {
                 Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
-                BottleneckCSP, C3, C3TR, C3SPP, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x}:
+                BottleneckCSP, C3, C3TR, C3SPP, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x,
+                CBRM, Shuffle_Block,
+                h_sigmoid, h_swish, SELayer, conv_bn_hswish, MobileNetV3}:
             c1, c2 = ch[f], args[0] # c1、c2分别代表输入和输出通道数
             if c2 != no:  # 如果输出通道数不是目标输出通道数，即该模块不是输出层，对输出通道数进行宽度倍数调整
                 c2 = make_divisible(c2 * gw, 8)
@@ -401,3 +403,4 @@ if __name__ == '__main__':
 
     else:  # report fused model summary
         model.fuse()
+    

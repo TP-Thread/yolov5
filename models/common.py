@@ -35,7 +35,7 @@ from utils.torch_utils import copy_attr, smart_inference_mode
 
 
 def autopad(k, p=None, d=1):  # kernel, padding, dilation
-    # 如果未提供 `p` 参数，则进行自动填充，使输出尺寸与输入相同 ('same' 填充)
+    # 如果未提供p参数，则进行自动填充，使输出尺寸与输入相同
     if d > 1:
         k = d * (k - 1) + 1 if isinstance(k, int) else [d * (x - 1) + 1 for x in k]  # actual kernel-size
     if p is None:
@@ -886,3 +886,199 @@ class Classify(nn.Module):
         if isinstance(x, list):
             x = torch.cat(x, 1)
         return self.linear(self.drop(self.pool(self.conv(x)).flatten(1)))
+
+
+''' ShuffleNet V2模块 '''
+# 通道重排，跨group信息交流
+def channel_shuffle(x, groups):
+    batchsize, num_channels, height, width = x.data.size()
+    channels_per_group = num_channels // groups
+
+    # reshape
+    x = x.view(batchsize, groups,
+               channels_per_group, height, width)
+
+    x = torch.transpose(x, 1, 2).contiguous()
+
+    # flatten
+    x = x.view(batchsize, -1, height, width)
+
+    return x
+
+
+class CBRM(nn.Module):           #conv BN ReLU Maxpool2d
+    def __init__(self, c1, c2):  # ch_in, ch_out
+        super(CBRM, self).__init__()
+        self.conv = nn.Sequential(
+            nn.Conv2d(c1, c2, kernel_size=3, stride=2, padding=1, bias=False),
+            nn.BatchNorm2d(c2),
+            nn.ReLU(inplace=True),
+        )
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1, dilation=1, ceil_mode=False)
+
+    def forward(self, x):
+        return self.maxpool(self.conv(x))
+
+
+class Shuffle_Block(nn.Module):
+    def __init__(self, ch_in, ch_out, stride):
+        super(Shuffle_Block, self).__init__()
+
+        if not (1 <= stride <= 2):
+            raise ValueError('illegal stride value')
+        self.stride = stride
+
+        branch_features = ch_out // 2
+        assert (self.stride != 1) or (ch_in == branch_features << 1)
+
+        if self.stride > 1:
+            self.branch1 = nn.Sequential(
+                self.depthwise_conv(ch_in, ch_in, kernel_size=3, stride=self.stride, padding=1),
+                nn.BatchNorm2d(ch_in),
+
+                nn.Conv2d(ch_in, branch_features, kernel_size=1, stride=1, padding=0, bias=False),
+                nn.BatchNorm2d(branch_features),
+                nn.ReLU(inplace=True),
+            )
+
+        self.branch2 = nn.Sequential(
+            nn.Conv2d(ch_in if (self.stride > 1) else branch_features,
+                      branch_features, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(branch_features),
+            nn.ReLU(inplace=True),
+
+            self.depthwise_conv(branch_features, branch_features, kernel_size=3, stride=self.stride, padding=1),
+            nn.BatchNorm2d(branch_features),
+
+            nn.Conv2d(branch_features, branch_features, kernel_size=1, stride=1, padding=0, bias=False),
+            nn.BatchNorm2d(branch_features),
+            nn.ReLU(inplace=True),
+        )
+
+    @staticmethod
+    def depthwise_conv(i, o, kernel_size, stride=1, padding=0, bias=False):
+        return nn.Conv2d(i, o, kernel_size, stride, padding, bias=bias, groups=i)
+
+    def forward(self, x):
+        if self.stride == 1:
+            x1, x2 = x.chunk(2, dim=1)  # 按照维度1进行split
+            out = torch.cat((x1, self.branch2(x2)), dim=1)
+        else:
+            out = torch.cat((self.branch1(x), self.branch2(x)), dim=1)
+
+        out = channel_shuffle(out, 2)
+
+        return out
+
+
+""" MobileNetV3 """
+class h_sigmoid(nn.Module):
+    def __init__(self, inplace=True):
+        super(h_sigmoid, self).__init__()
+        self.relu = nn.ReLU6(inplace=inplace)
+ 
+    def forward(self, x):
+        return self.relu(x + 3) / 6
+ 
+ 
+class h_swish(nn.Module):
+    def __init__(self, inplace=True):
+        super(h_swish, self).__init__()
+        self.sigmoid = h_sigmoid(inplace=inplace)
+ 
+    def forward(self, x):
+        return x * self.sigmoid(x)
+ 
+ 
+class SELayer(nn.Module):
+    def __init__(self, channel, reduction=4):
+        super(SELayer, self).__init__()
+        # Squeeze操作
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        # Excitation操作(FC+ReLU+FC+Sigmoid)
+        self.fc = nn.Sequential(
+            nn.Linear(channel, channel // reduction),
+            nn.ReLU(inplace=True),
+            nn.Linear(channel // reduction, channel),
+            h_sigmoid()
+        )
+ 
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x)
+        y = y.view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)  # 学习到的每一channel的权重
+        return x * y
+ 
+ 
+class conv_bn_hswish(nn.Module):
+    """
+    This equals to
+    def conv_3x3_bn(inp, oup, stride):
+        return nn.Sequential(
+            nn.Conv2d(inp, oup, 3, stride, 1, bias=False),
+            nn.BatchNorm2d(oup),
+            h_swish()
+        )
+    """
+ 
+    def __init__(self, c1, c2, stride):
+        super(conv_bn_hswish, self).__init__()
+        self.conv = nn.Conv2d(c1, c2, 3, stride, 1, bias=False)
+        self.bn = nn.BatchNorm2d(c2)
+        self.act = h_swish()
+ 
+    def forward(self, x):
+        return self.act(self.bn(self.conv(x)))
+ 
+    def fuseforward(self, x):
+        return self.act(self.conv(x))
+ 
+ 
+class MobileNetV3(nn.Module):
+    def __init__(self, inp, oup, hidden_dim, kernel_size, stride, use_se, use_hs):
+        super(MobileNetV3, self).__init__()
+        assert stride in [1, 2]
+ 
+        self.identity = stride == 1 and inp == oup
+ 
+        # 输入通道数=扩张通道数 则不进行通道扩张
+        if inp == hidden_dim:
+            self.conv = nn.Sequential(
+                # dw
+                nn.Conv2d(hidden_dim, hidden_dim, kernel_size, stride, (kernel_size - 1) // 2, groups=hidden_dim,
+                          bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                h_swish() if use_hs else nn.ReLU(inplace=True),
+                # Squeeze-and-Excite
+                SELayer(hidden_dim) if use_se else nn.Sequential(),
+                # pw-linear
+                nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(oup),
+            )
+        else:
+            # 否则 先进行通道扩张
+            self.conv = nn.Sequential(
+                # pw
+                nn.Conv2d(inp, hidden_dim, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                h_swish() if use_hs else nn.ReLU(inplace=True),
+                # dw
+                nn.Conv2d(hidden_dim, hidden_dim, kernel_size, stride, (kernel_size - 1) // 2, groups=hidden_dim,
+                          bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                # Squeeze-and-Excite
+                SELayer(hidden_dim) if use_se else nn.Sequential(),
+                h_swish() if use_hs else nn.ReLU(inplace=True),
+                # pw-linear
+                nn.Conv2d(hidden_dim, oup, 1, 1, 0, bias=False),
+                nn.BatchNorm2d(oup),
+            )
+ 
+    def forward(self, x):
+        y = self.conv(x)
+        if self.identity:
+            return x + y
+        else:
+            return y
+        
