@@ -3,13 +3,13 @@ import time
 import cv2
 
 # 加载 YOLOv5 本地模型
-yolov5_path = '/home/vic/yolov5'
+yolov5_path = ''
 weight_path = 'weights/yolov5s-shufflenetv2/best.pt'
-weight_path = 'weights/yolov5s-mobilenetv3/best.pt'
+# weight_path = 'weights/yolov5s-mobilenetv3/best.pt'
 model = torch.hub.load(yolov5_path, 'custom', weight_path, source='local')
 
 # 读取测试视频
-cap = cv2.VideoCapture(4)
+cap = cv2.VideoCapture(0)
 # 设置摄像头帧率和分辨率
 cap.set(cv2.CAP_PROP_FPS, 60)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
